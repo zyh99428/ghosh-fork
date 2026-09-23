@@ -255,6 +255,7 @@ ghost_game_node:
     gesture_position_gain: 6.5         # 1/s, tuned from live palm tracking profile
     gesture_max_linear_speed: 0.5     # m/s, faster camera-axis response
     gesture_max_joint_speed: 1.0      # rad/s, matched by MIT reference limits
+    gesture_max_joint_acceleration: 8.0 # rad/s^2; removes abrupt stop/start jerk
     gesture_tracking_error_limit: 0.18 # rad; blocked arm rebases at measured pose
     # Move the open palm horizontally to steer the camera with the same J5
     # direction commissioned for face tracking. Depth still controls reach.

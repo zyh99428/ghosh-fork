@@ -158,6 +158,7 @@ class CameraAxisServo:
         joint_max_offsets,
         max_linear_speed=0.06,
         max_joint_speed=0.35,
+        max_joint_acceleration=8.0,
         position_gain=2.5,
         orientation_gain=2.0,
         damping=0.06,
@@ -177,15 +178,22 @@ class CameraAxisServo:
             raise ValueError("camera servo anchor is outside its bounded joint workspace")
         self.max_linear_speed = float(max_linear_speed)
         self.max_joint_speed = float(max_joint_speed)
+        self.max_joint_acceleration = float(max_joint_acceleration)
         self.position_gain = float(position_gain)
         self.orientation_gain = float(orientation_gain)
         self.damping = float(damping)
         if any(not math.isfinite(value) or value <= 0 for value in (
-                self.max_linear_speed, self.max_joint_speed, self.position_gain,
+                self.max_linear_speed, self.max_joint_speed,
+                self.max_joint_acceleration, self.position_gain,
                 self.orientation_gain, self.damping)):
             raise ValueError("camera servo gains and limits must be positive")
         self.anchor_position, self.anchor_rotation, _ = camera_pose_and_jacobian(anchor)
         self.axis = self.anchor_rotation[:, 2].copy()
+        self._last_velocity = np.zeros(6, dtype=float)
+
+    def reset_velocity(self):
+        """Restart the next motion from zero after a real hold or rebase."""
+        self._last_velocity.fill(0.0)
 
     @staticmethod
     def _limit_norm(vector, limit):
@@ -257,8 +265,15 @@ class CameraAxisServo:
             velocity[free_indices] = free_velocity
             velocity[index] = direct_velocity
         velocity = np.clip(velocity, -self.max_joint_speed, self.max_joint_speed)
+        max_velocity_delta = self.max_joint_acceleration * float(dt)
+        velocity = np.clip(
+            velocity,
+            self._last_velocity - max_velocity_delta,
+            self._last_velocity + max_velocity_delta,
+        )
         next_command = np.clip(command + velocity * float(dt), self.lower, self.upper)
         actual_velocity = (next_command - command) / float(dt)
+        self._last_velocity = actual_velocity.copy()
         return ServoStep(
             positions=next_command.tolist(),
             velocities=actual_velocity.tolist(),
@@ -343,7 +358,11 @@ class PalmDepthFilter:
         if (self.last_valid_at is not None and
                 now - self.last_valid_at > self.reacquire_timeout):
             self.reset()
-        self.last_valid_at = now
+        # Track the actual ROS arrival time, not this 80 Hz servo tick. The
+        # control loop may process the same perception sample several times;
+        # refreshing with ``now`` would keep a stale sample alive for almost
+        # twice sample_timeout and delay the safety hold.
+        self.last_valid_at = float(received_at)
         if self.hand_id != hand_id or self.baseline is None:
             self.hand_id = hand_id
             self.baseline = distance

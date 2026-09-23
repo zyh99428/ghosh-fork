@@ -82,12 +82,15 @@ class PalmProfiler(Node):
         self.tracking_error = []
         self.command_delta = []
         self.command_speed = []
+        self.command_acceleration = []
         self.command_measured_error = []
         self.yaw_offset = []
         self.yaw_tracking_samples = 0
         self.palm_total = 0
         self.palm_usable = 0
         self.active_state_samples = 0
+        self.previous_command_velocity = None
+        self.previous_command_time = None
 
     def now(self):
         return time.monotonic() - self.started
@@ -169,9 +172,22 @@ class PalmProfiler(Node):
         velocities = [
             float(value) for value in message.velocities[:len(JOINTS)]
         ]
-        self.command_times.append(time.monotonic())
-        if velocities:
+        received_at = time.monotonic()
+        self.command_times.append(received_at)
+        if len(velocities) == len(JOINTS):
             self.command_speed.append(max(abs(value) for value in velocities))
+            if (self.previous_command_velocity is not None and
+                    self.previous_command_time is not None and
+                    received_at > self.previous_command_time):
+                dt = received_at - self.previous_command_time
+                self.command_acceleration.append(max(
+                    abs(current - previous) / dt
+                    for current, previous in zip(
+                        velocities, self.previous_command_velocity,
+                        strict=True)
+                ))
+            self.previous_command_velocity = velocities
+            self.previous_command_time = received_at
         if self.latest_joint_positions is not None:
             self.command_measured_error.append(max(
                 abs(command - measured)
@@ -205,6 +221,8 @@ class PalmProfiler(Node):
             "tracking_error_rad": metric(self.tracking_error),
             "command_delta_rad": metric(self.command_delta),
             "command_speed_rad_s": metric(self.command_speed),
+            "command_acceleration_rad_s2": metric(
+                self.command_acceleration),
             "command_measured_error_rad": metric(
                 self.command_measured_error),
             "yaw_tracking_samples": self.yaw_tracking_samples,

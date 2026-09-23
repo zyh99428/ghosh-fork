@@ -25,7 +25,7 @@ MediaPipe 原模型提供 21 个手部关键点及有限的静态类别，**不�
 
 兼容字段 `dz` 仍来自手掌表观尺寸变化；实际前后控制使用 `/camera/depth/image_raw/compressedDepth` 的彩色对齐深度。节点缓存最近 12 个压缩深度帧，为每个 RGB 推理结果选择时间戳最接近的 D2C 帧，解码对应 PNG 后在掌心附近圆形区域过滤零值、无穷值和范围外像素并取中值。压缩传输避免把约 0.9 MB 的原始深度帧复制进 Python；现场 profile 中对齐深度接收率约提高一倍。手掌中心相对画面中心的水平误差同时驱动 `joint5`，在局部 ±0.45 rad 范围内以最高 1.00 rad/s 转动相机；J5 在互动阶段使用 `kp=18`，六轴求解器将它作为显式受控关节，因此深度伺服不会抵消该偏航动作。`/gestures/palm_control` 会发布 `palm_open`、`palm_source`、`distance_m`、`distance_valid`、RGB/深度时间差、推理耗时及有效像素数。偶发的单帧丢手或深度失效会短暂保持最后一个有界位置目标，最长 0.20 秒；持续丢失、最大目标换手或超时后才冻结运动。
 
-完整游戏在人脸捕获并提交重建、完成打量动作后进入 `gesture_interaction`。进入该阶段前会重新发布一次夹爪打开命令，并等待 `gripper_settle_time`，夹爪稳定张开后才启用手掌感知与随动；Palm Mock 也经过相同入口。第一帧稳定张掌的米制距离成为中点：手掌靠近相机时距离减小，机械臂沿初始相机光轴后退；手掌远离时机械臂向前探。控制器以 80 Hz 对六轴 URDF 几何雅可比做阻尼最小二乘求解，同时保持相机朝向；随动配置使用 1 cm 死区、±8 cm 行程、16 cm/s 直线速度和 0.65 rad/s 关节速度。短于 0.20 秒的丢手或深度失效保持最后位置目标，随后冻结；原始中点保留 1.00 秒，避免一帧分类或深度抖动反复把当前位置重置为零点。超过该窗口或换手才重新采集中点。机械臂受阻且跟踪误差超过 0.18 rad 时在实测位置重新建立命令，避免继续累积误差。
+完整游戏在人脸捕获并提交重建、完成打量动作后进入 `gesture_interaction`。进入该阶段前会重新发布一次夹爪打开命令，并等待 `gripper_settle_time`，夹爪稳定张开后才启用手掌感知与随动；Palm Mock 也经过相同入口。第一帧稳定张掌的米制距离成为中点：手掌靠近相机时距离减小，机械臂沿初始相机光轴后退；手掌远离时机械臂向前探。控制器以 80 Hz 对六轴 URDF 几何雅可比做阻尼最小二乘求解，同时保持相机朝向；随动配置使用 1 cm 死区、±8 cm 行程、0.5 m/s 直线速度和 1.0 rad/s 关节速度上限，并以 8.0 rad/s² 限制相邻指令的速度变化。短于 0.20 秒的丢手或深度失效继续跟踪最后一个有界目标，不再停止后立即重启；随后冻结。超时按最后一条有效 ROS 消息的实际到达时间计算，80 Hz 控制循环重复读取同一帧不会延长它的有效期。原始中点保留 1.00 秒，避免一帧分类或深度抖动反复把当前位置重置为零点。超过该窗口或换手才重新采集中点。机械臂受阻且跟踪误差超过 0.18 rad 时在实测位置重新建立命令，避免继续累积误差。
 
 调试时 Web 引导会显示 `control_reason`。`baseline_captured` 表示刚建立中点，`inside_deadzone` 表示掌距变化小于 1 cm，`tracking` 表示已经输出运动，`arming` 表示张掌还未稳定满 0.20 秒，`rgb_depth_skew`/`stale_sample` 表示时间同步或输入时效问题。也可以直接检查：
 
@@ -42,6 +42,12 @@ ros2 service call /ghost_game_node/mock_palm_interaction std_srvs/srv/Trigger {}
 它会抢占当前 searching、人脸、轨迹或其他游戏阶段，等待原控制线程安全退出后，先恢复重力补偿，通过阻抗 JTC 平滑运动到并实测校验 `success_positions`。到位后才以 success pose 作为关节锚点和相机光轴基准，切换到直接阻抗控制并进入 `gesture_interaction`。此过程跳过人脸检测、打量动作和人脸重建。调试模式忽略上一轮遗留的 FLUX/Mesh 终态，持续到 `gesture_interaction_max_duration`；可随时使用现有 Abort 或 Return Home 按钮结束。
 
 游戏节点每秒还会输出一条 `Palm servo accepted`，其中包含 `offset`、`joint_step` 和 `tracking_error`；若未接管则每两秒输出 `Palm servo waiting` 及拒绝原因。图像里仅出现 bbox 和距离说明检测与深度采样有效，不代表稳定张掌门控已经通过。
+
+真机复测时可采集 20 秒端到端 profile。输出会同时统计手掌消息、80 Hz 阻抗指令、图像源年龄、推理耗时、命令速度与命令加速度；原始事件写入 JSONL，便于区分感知丢帧、控制调度抖动和机械臂跟踪误差：
+
+```bash
+python3 scripts/profile_palm_tracking.py --wait-for-palm --duration 20
+```
 
 Orbbec 启动文件已开启 `depth_registration=true`、`align_target_stream=COLOR`，并关闭未使用的点云。该设置只在相机驱动重启后生效。互动至少持续 8 秒；Tripo 的 `/ghost/reconstruction/mesh_status` 成功或失败后结束，最长 90 秒。相关行程、速度、时长和深度参数集中在 `ghost_game_orchestrator/config/ghost_game.yaml` 与 `ghost_game_perception/config/ghost_game.yaml`。
 

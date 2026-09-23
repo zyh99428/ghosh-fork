@@ -57,6 +57,16 @@ def test_brief_invalid_palm_holds_then_fails_closed():
     assert tracker.update(payload(.4), .22, .22) < 0
 
 
+def test_reprocessed_sample_does_not_extend_watchdog_timeout():
+    tracker = PalmDepthFilter(sample_timeout=.2, reacquire_timeout=.5)
+    assert tracker.update(payload(.5), 0, 0) == 0
+    # The 80 Hz loop processes a single perception message more than once.
+    # Its original arrival time remains the watchdog reference.
+    assert tracker.update(payload(.6), .01, .19) is not None
+    assert tracker.update(payload(.6), .01, .22) is None
+    assert tracker.last_reason == "stale_sample"
+
+
 def test_landmark_palm_is_accepted_when_semantic_label_is_unknown():
     tracker = PalmDepthFilter(smoothing_time=.001)
     first = payload(.5)
@@ -150,3 +160,29 @@ def test_cartesian_servo_tracks_yawed_reference_and_depth_together():
     assert command[4] == pytest.approx(reference[4], abs=.01)
     assert np.linalg.norm(actual_position - desired_position) < .02
     assert np.linalg.norm(actual_rotation - desired_rotation) < .08
+
+
+def test_servo_limits_joint_acceleration_and_reset_restarts_from_zero():
+    dt = .0125
+    acceleration_limit = 8.0
+    servo = CameraAxisServo(
+        ANCHOR, LOWER, UPPER, [.12, .35, .35, .35, .45, .18],
+        max_linear_speed=.5,
+        max_joint_speed=1.0,
+        max_joint_acceleration=acceleration_limit,
+        position_gain=6.5,
+    )
+    command = list(ANCHOR)
+    previous_velocity = np.zeros(6)
+    for _ in range(12):
+        step = servo.step(command, .08, dt)
+        velocity = np.asarray(step.velocities)
+        assert (np.max(np.abs(velocity - previous_velocity)) <=
+                acceleration_limit * dt + 1e-8)
+        command = step.positions
+        previous_velocity = velocity
+
+    servo.reset_velocity()
+    restarted = servo.step(command, -.08, dt)
+    assert (max(abs(value) for value in restarted.velocities) <=
+            acceleration_limit * dt + 1e-8)

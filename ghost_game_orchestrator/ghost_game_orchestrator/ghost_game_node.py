@@ -316,6 +316,7 @@ class GhostGameNode(Node):
             'distance_m': None,
             'offset_m': 0.0,
             'control_active': False,
+            'target_held': False,
             'label': 'unknown',
             'palm_open': False,
             'palm_source': 'none',
@@ -674,6 +675,7 @@ class GhostGameNode(Node):
         self.declare_parameter('gesture_position_gain', 6.5)
         self.declare_parameter('gesture_max_linear_speed', 0.22)
         self.declare_parameter('gesture_max_joint_speed', 0.80)
+        self.declare_parameter('gesture_max_joint_acceleration', 8.0)
         self.declare_parameter('gesture_tracking_error_limit', 0.18)
         self.declare_parameter('gesture_yaw_enabled', True)
         self.declare_parameter('gesture_yaw_gain', 2.50)
@@ -917,6 +919,8 @@ class GhostGameNode(Node):
             p('gesture_max_linear_speed').value)
         self.gesture_max_joint_speed = float(
             p('gesture_max_joint_speed').value)
+        self.gesture_max_joint_acceleration = float(
+            p('gesture_max_joint_acceleration').value)
         self.gesture_tracking_error_limit = float(
             p('gesture_tracking_error_limit').value)
         self.gesture_yaw_enabled = bool(p('gesture_yaw_enabled').value)
@@ -944,6 +948,7 @@ class GhostGameNode(Node):
             self.gesture_position_gain,
             self.gesture_max_linear_speed,
             self.gesture_max_joint_speed,
+            self.gesture_max_joint_acceleration,
             self.gesture_tracking_error_limit,
             self.gesture_yaw_gain,
             self.gesture_yaw_max_speed,
@@ -2244,6 +2249,7 @@ class GhostGameNode(Node):
                 self.gesture_joint_max_offsets,
                 max_linear_speed=self.gesture_max_linear_speed,
                 max_joint_speed=self.gesture_max_joint_speed,
+                max_joint_acceleration=self.gesture_max_joint_acceleration,
                 position_gain=self.gesture_position_gain,
             )
             depth_filter = PalmDepthFilter(
@@ -2284,6 +2290,7 @@ class GhostGameNode(Node):
                 'distance_m': None,
                 'offset_m': 0.0,
                 'control_active': False,
+                'target_held': False,
                 'label': 'unknown',
                 'palm_open': False,
                 'palm_source': 'none',
@@ -2359,7 +2366,11 @@ class GhostGameNode(Node):
                 payload = self._latest_palm_control
                 received_at = self._latest_palm_received_at
             target_offset = depth_filter.update(payload, received_at, now)
-            hand_detected = target_offset is not None
+            target_available = target_offset is not None
+            target_held = (
+                target_available and
+                depth_filter.last_reason.startswith('holding_'))
+            hand_detected = target_available and not target_held
             sample_age_ms = (
                 None if received_at <= 0.0 else
                 max(0.0, (now - received_at) * 1000.0))
@@ -2379,12 +2390,13 @@ class GhostGameNode(Node):
                 if isinstance(diagnostic_payload.get('depth_skew_sec'), (int, float))
                 else None)
             distance = None
-            if hand_detected:
+            if isinstance(diagnostic_payload.get('distance_m'), (int, float)):
                 try:
-                    distance = float(payload['distance_m'])
-                except (KeyError, TypeError, ValueError):
-                    hand_detected = False
-                    target_offset = None
+                    candidate_distance = float(diagnostic_payload['distance_m'])
+                    if math.isfinite(candidate_distance):
+                        distance = candidate_distance
+                except (TypeError, ValueError):
+                    pass
             if target_offset is not None:
                 servo_offset = target_offset
             if yaw_visible and dt > 0.0:
@@ -2426,12 +2438,13 @@ class GhostGameNode(Node):
                 # A hand or obstacle can block this compliant game. Rebase the
                 # command at the measured pose instead of building more error.
                 command = list(measured)
+                servo.reset_velocity()
                 self._publish_impedance_command(command)
                 self.get_logger().warn(
                     'Palm servo tracking error exceeded limit; holding the '
                     'measured pose before resuming',
                     throttle_duration_sec=1.0)
-            elif (hand_detected or yaw_visible) and dt > 0.0:
+            elif (target_available or yaw_visible) and dt > 0.0:
                 try:
                     step = servo.step(
                         command, servo_offset, dt,
@@ -2453,6 +2466,7 @@ class GhostGameNode(Node):
                 self._publish_impedance_command(command, step.velocities)
             else:
                 # A lost/closed hand freezes the last equilibrium immediately.
+                servo.reset_velocity()
                 self._publish_impedance_command(command)
 
             if hand_detected:
@@ -2466,6 +2480,13 @@ class GhostGameNode(Node):
                     f'input_age={sample_age_ms:.1f} ms, '
                     f'depth_age={depth_age_ms} ms, '
                     f'depth_skew={depth_skew_ms} ms',
+                    throttle_duration_sec=1.0)
+            elif target_held:
+                self.get_logger().info(
+                    'Palm servo bridging transient dropout: '
+                    f'reason={depth_filter.last_reason}, '
+                    f'offset={servo_offset:+.3f} m, '
+                    f'sample_age_ms={sample_age_ms}',
                     throttle_duration_sec=1.0)
             else:
                 self.get_logger().warn(
@@ -2485,8 +2506,9 @@ class GhostGameNode(Node):
                     'active': True,
                     'hand_detected': hand_detected,
                     'distance_m': distance,
-                    'offset_m': 0.0 if target_offset is None else target_offset,
-                    'control_active': diagnostic_payload.get('active') is True,
+                    'offset_m': servo_offset,
+                    'control_active': target_available or yaw_visible,
+                    'target_held': target_held,
                     'label': str(diagnostic_payload.get('label', 'unknown')),
                     'palm_open': diagnostic_payload.get('palm_open') is True,
                     'palm_source': str(
